@@ -1,0 +1,14 @@
+# 1. 指定 PyTorch 的下载源 (改为 CUDA 11.3)
+-f https://download.pytorch.org/whl/cu113/torch_stable.html
+
+# 2. 原始包列表 (已修正冲突，并改为 cu113)
+aotools==1.0.7
+matplotlib==3.7.5
+numpy==1.23.5
+Pillow==9.5.0
+pytorch_lightning==1.5.2
+scipy==1.9.3
+torch==1.10.1+cu113
+torchgeometry==0.1.2
+torchmetrics==1.4.0.post0
+torchvision==0.11.2+cu113

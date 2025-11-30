@@ -1,0 +1,40 @@
+# 训练日志和模型文件
+training_logs/
+*.ckpt
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 环境变量
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 输出文件
+fabrication_output/
+*.npy
+*.png
+*.jpg
+*.jpeg
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 测试文件
+PSFoverFOV/
+test/
