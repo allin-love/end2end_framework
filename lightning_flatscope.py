@@ -1,104 +1,71 @@
+from argparse import ArgumentParser, Namespace
+from typing import cast
 import torch
-import torch.nn as nn
 import torch.optim
-import matplotlib.pyplot as plt
 import pytorch_lightning as pl
 import torch.nn.functional as F
-from network.simple_model import SimpleModel
-from argparse import ArgumentParser
 import torchvision.utils
-from camera import camera_zernike_axial, camera_rotation_axial, camera_binary_rings
-from torchmetrics.regression import *
-from torchmetrics.image import PeakSignalNoiseRatio
+from camera import camera_binary_rings
 from util.helper import *
-from util.deconvolution import apply_tikhonov_inverse
-from torch.fft import ifftshift, ifft2
 
 
-class flatscope(pl.core.LightningModule):
+class flatscope(pl.LightningModule):
     def __init__(self, hparams, log_dir=None):
         super().__init__()
         self.save_hyperparameters(hparams)
 
         self.__build_model()
-        self.metrics = nn.ModuleDict({'image_loss': MeanSquaredError()})
-
-        self.evaluation_metrics = nn.ModuleDict({
-            # 'image_loss': MeanSquaredError(),
-            'image_loss': MeanAbsoluteError(),
-            'image_psnr': PeakSignalNoiseRatio(),
-        })
-
         self.log_dir = log_dir
 
+    @property
+    def cfg(self) -> Namespace:
+        return cast(Namespace, self.hparams)
+
     def configure_optimizers(self):
-        if self.hparams.deconvolution:   #在重建部分使用解卷机
-            params = [
-                {'params': self.camera.parameters(), 'lr': self.hparams.optics_lr},
-                {'params': self.gamma, 'lr': self.hparams.gamma_lr},
-            ]
-        else:  #在重建部分使用神经网络
-            params = [
-                {'params': self.camera.parameters(), 'lr': self.hparams.optics_lr},
-                {'params': self.decoder.parameters(), 'lr': self.hparams.cnn_lr},
-            ]
+        params = [{'params': self.camera.parameters(), 'lr': self.cfg.optics_lr}]
         optimizer = torch.optim.Adam(params)
-        lr_scheduler = {'scheduler': torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.hparams.gamma),
+        lr_gamma = getattr(self.cfg, 'lr_gamma', 0.98)
+        lr_scheduler = {'scheduler': torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=lr_gamma),
                         'name': 'lr_decay_curve'}
         return [optimizer], [lr_scheduler]
 
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure=None, on_tpu=False,
-                       using_native_amp=False, using_lbfgs=False):
-        # # warm up lr
-        # if self.trainer.global_step < 4000:
-        #     lr_scale = min(1., float(self.trainer.global_step + 1) / 4000.)
-        #     optimizer.param_groups[0]['lr'] = lr_scale * self.hparams.optics_lr
-        #     optimizer.param_groups[1]['lr'] = lr_scale * self.hparams.cnn_lr
-
-        # update params
-        optimizer.step(closure=optimizer_closure)  # 在用高版本的pytorch-lightning时，要把optimizer_closure传入optimizer.step()
-        optimizer.zero_grad()
 
     def training_step(self, samples, batch_idx):
         psfs, targets, captimgs, outputs = self.forward(samples)
-        data_loss, loss_logs = self.__compute_loss(outputs, targets)
+        data_loss, loss_logs = self.__compute_loss(outputs, targets, psfs)
         loss_logs = {f'train_loss/{key}': val for key, val in loss_logs.items()}
 
-        if self.hparams.optimize_optics:
+        if self.cfg.optimize_optics:
             misc_logs = {
                 'optics/optim_param_max': self.camera.optim_param.max(),
                 'optics/optim_param_min': self.camera.optim_param.min(),
                 'optics/optim_param_mean': self.camera.optim_param.mean(),
-                'optics/L2_gamma_mean': self.gamma.mean(),
-                'optics/L2_gamma_min': self.gamma.min(),
-                'optics/L2_gamma_max': self.gamma.max(),
             }
+            with torch.no_grad():
+                ring_radii = self.camera.get_ring_radii().detach()
+                lens_radius_mm = self.cfg.lens_diameter * 1e3 / 2.0
+                spacing = torch.diff(ring_radii, prepend=ring_radii.new_tensor([0.0])) * lens_radius_mm
+                misc_logs['optics/min_ring_spacing_um'] = spacing.min() * 1e3
+                misc_logs['optics/max_ring_spacing_um'] = spacing.max() * 1e3
+                misc_logs['optics/mask_pixel_pitch_um'] = torch.tensor(self.camera.mask_pixel_pitch * 1e6)
 
         logs = {}
         logs.update(loss_logs)
-        if self.hparams.optimize_optics:
+        if self.cfg.optimize_optics:
             logs.update(misc_logs)
         self.log_dict(logs)
 
-        if not self.global_step % self.hparams.summary_track_train_every:
+        if not self.global_step % self.cfg.summary_track_train_every:
             self.__log_images(psfs, targets, captimgs, outputs, 'train')
 
         return data_loss
 
-    def on_validation_epoch_start(self) -> None:
-        for metric in self.metrics.values():
-            metric.reset()
-            metric.to(self.device)
-
     def validation_step(self, samples, batch_idx):
         psfs, targets, captimgs, outputs = self.forward(samples)
 
-
-        # 这是原始代码 (Line 96)
-        # self.metrics['image_loss'](outputs, targets.repeat(1, outputs.shape[1],1,1))
-
-        self.metrics['image_loss'](outputs.contiguous(), targets.repeat(1, outputs.shape[1],1,1).contiguous())
-        self.log('validation/image_loss', self.metrics['image_loss'], on_step=False, on_epoch=True)
+        repeated_targets = targets.repeat(1, outputs.shape[1], 1, 1)
+        val_loss = F.mse_loss(outputs.contiguous(), repeated_targets.contiguous())
+        self.log('validation/image_loss', val_loss, on_step=False, on_epoch=True, prog_bar=True)
 
         if batch_idx == 0:
             self.__log_images(psfs, targets, captimgs, outputs, 'validation')
@@ -106,39 +73,38 @@ class flatscope(pl.core.LightningModule):
     def forward(self, targets):
         psfs = self.camera.gen_psf()
 
-        #####这里光学仿真的采样间隔为0.5um，但是考虑相机实际像元为1um或更大，故对psf仿真结果进行binning，以模拟相机拍到的psf
-        # if self.hparams.camera_pixel_pitch < 1e-6:
-        #     psfs_downsample = binnning(2, psfs).float()
-        # else:
-        #     psfs_downsample = psfs.float()
-        psfs_downsample = psfs.float() #直接使用0.5um采样间隔的psf进行仿真
+        bin_factor = getattr(self.cfg, 'psf_binning_factor', 1)
+        if bin_factor and bin_factor > 1:
+            psfs = binnning(bin_factor, psfs).float()
+        else:
+            psfs = psfs.float()
 
-        padding = (self.hparams.image_size - psfs_downsample.shape[-1]) // 2
-        psfs_downsample = F.pad(psfs_downsample, (padding, padding, padding, padding))
-        noise_sigma = (self.hparams.noise_sigma_max - self.hparams.noise_sigma_min) * torch.rand(
+        target_size = self.cfg.image_size
+        psf_size = psfs.shape[-1]
+        if psf_size < target_size:
+            padding = (target_size - psf_size) // 2
+            psfs_for_conv = F.pad(psfs, (padding, padding, padding, padding))
+        elif psf_size > target_size:
+            psfs_for_conv = crop_image(psfs, target_size)
+        else:
+            psfs_for_conv = psfs
+
+        noise_sigma = (self.cfg.noise_sigma_max - self.cfg.noise_sigma_min) * torch.rand(
             (targets.shape[0], 1, 1, 1), device=targets.device,
-            dtype=targets.dtype) + self.hparams.noise_sigma_min
-        captimgs = conv_psf(targets, psfs_downsample) + \
+            dtype=targets.dtype) + self.cfg.noise_sigma_min
+        chunk_size = getattr(self.cfg, 'psf_chunk_size', 0)
+        captimgs = conv_psf(targets, psfs_for_conv, chunk_size=chunk_size) + \
                    noise_sigma * torch.randn((targets.shape[0], 1, targets.shape[-2], targets.shape[-1]),
                                              device=targets.device, dtype=targets.dtype)
 
-        if self.hparams.deconvolution:
-
-            center_ind = psfs_downsample.shape[1] // 2
-            psf_center = psfs_downsample[:, center_ind].unsqueeze(1)
-            gamma = torch.clamp(self.gamma, min=1e-8, max=5e-3)
-            outputs = L2_deconvolution(captimgs, psf_center, gamma)
-            captimgs = crop_image(captimgs, 288)
-            outputs = crop_image(outputs, 288)
-        else:
-            captimgs = crop_image(captimgs, 288)
-            outputs = self.decoder(captimgs)
-
-        targets = crop_image(targets, 288)
+        recon_crop = getattr(self.cfg, 'reconstruction_crop', getattr(self.cfg, 'psf_crop_size', self.cfg.image_size))
+        captimgs = crop_image(captimgs, recon_crop)
+        outputs = captimgs
+        targets = crop_image(targets, recon_crop)
         return psfs, targets, captimgs, outputs
 
     def __build_model(self):   #框架各部分模块配置
-        hparams = self.hparams
+        hparams = self.cfg
 
         camera_recipe = {
             'image_size': hparams.image_size,
@@ -155,47 +121,84 @@ class flatscope(pl.core.LightningModule):
         ########选择你需要的cameara（每个cameara的DOE的参数化方式不同）
         # self.camera = camera_zernike_axial.BaseCamera(**camera_recipe, requires_grad=optimize_optics)   #用zernike表示相位面
         # self.camera = camera_rotation_axial.BaseCamera(**camera_recipe, requires_grad=optimize_optics) #用旋转对称型结构表示相位面
-        
+
         # 新增：同心圆二元相位板（更适合加工）
         # 将 num_polynomials 参数映射为 num_rings（环带数量）
         camera_recipe_rings = camera_recipe.copy()
         camera_recipe_rings['num_rings'] = camera_recipe_rings.pop('num_polynomials')  # 用 num_rings 代替 num_polynomials
+        camera_recipe_rings['window_cropsize'] = getattr(hparams, 'psf_window', camera_recipe_rings['image_size'])
+        camera_recipe_rings['mask_pixel_pitch'] = getattr(hparams, 'mask_pixel_pitch', 2e-6)
+        camera_recipe_rings['ring_softness'] = getattr(hparams, 'ring_softness', 60.0)
+        camera_recipe_rings['psf_crop_size'] = getattr(hparams, 'psf_crop_size', camera_recipe_rings['window_cropsize'])
         self.camera = camera_binary_rings.BinaryRingsCamera(**camera_recipe_rings, require_grad=optimize_optics)
 
-        if not self.hparams.deconvolution:
-            self.decoder = SimpleModel(image_ch=len(self.camera.obj_offsets_x) * len(self.camera.obj_offsets_y),
-                                       output_ch=len(self.camera.obj_offsets_x) * len(self.camera.obj_offsets_y))
-        # self.image_lossfn = nn.MSELoss()
+        depth_min = getattr(hparams, 'depth_min', -0.5e-3)
+        depth_max = getattr(hparams, 'depth_max', 0.5e-3)
+        depth_planes = max(2, getattr(hparams, 'depth_planes', 5))
+        self.camera.delta_z = torch.linspace(depth_min, depth_max, depth_planes).tolist()
 
         print(self.camera)
-        psf_number = len(self.camera.delta_z) * len(self.camera.obj_offsets_x) * len(self.camera.obj_offsets_y) * len(
-            self.camera.wavelengths)
-        self.register_parameter('gamma', nn.Parameter(torch.ones(1, psf_number, 1, 1) * 5e-4))
 
-    def __compute_loss(self, outputs, targets):
+    def __compute_loss(self, outputs, targets, psfs=None):
 
         image_l1_loss = self.img_l1_loss(targets, outputs)
 
         logs = {
             'image_l1_loss': image_l1_loss,
-
         }
 
-        total_loss = self.hparams.l1_loss_weight * image_l1_loss
+        total_loss = self.cfg.l1_loss_weight * image_l1_loss
+
+        if psfs is not None:
+            psf_terms = self.__psf_regularizers(psfs)
+            var_weight = getattr(self.cfg, 'psf_consistency_weight', 0.0)
+            worst_weight = getattr(self.cfg, 'psf_worst_weight', 0.0)
+            focus_weight = getattr(self.cfg, 'focus_balance_weight', 0.0)
+            if var_weight > 0:
+                total_loss = total_loss + var_weight * psf_terms['variance']
+                logs['psf/variance'] = psf_terms['variance'].detach()
+            if worst_weight > 0:
+                total_loss = total_loss + worst_weight * psf_terms['worst_l1']
+                logs['psf/worst_l1'] = psf_terms['worst_l1'].detach()
+
+            target_center = getattr(self.cfg, 'focus_center_target', -1.0)
+            if target_center < 0:
+                target_center = (psfs.shape[1] - 1) / 2.0
+            focus_penalty = torch.mean((psf_terms['depth_center'] - target_center) ** 2)
+            if focus_weight > 0:
+                total_loss = total_loss + focus_weight * focus_penalty
+                logs['psf/focus_shift_penalty'] = focus_penalty.detach()
+
+            logs.setdefault('psf/variance', psf_terms['variance'].detach())
+            logs.setdefault('psf/worst_l1', psf_terms['worst_l1'].detach())
+            logs['psf/depth_center'] = psf_terms['depth_center'].mean().detach()
 
         return total_loss, logs
 
 
     def img_l1_loss(self, targets, outputs):
-        
+        return F.l1_loss(outputs, targets)
+
+    def __psf_regularizers(self, psfs):
         eps = 1e-8
-        targets = targets / (torch.sum(targets, dim=[-2, -1], keepdim=True) + eps)
-        outputs = outputs / (torch.sum(outputs, dim=[-2, -1], keepdim=True) + eps)
+        psfs = psfs / (psfs.sum(dim=(-2, -1), keepdim=True) + eps)
+        batch, depth = psfs.shape[0], psfs.shape[1]
+        psfs_flat = psfs.view(batch, depth, -1)
+        mean_psf = psfs_flat.mean(dim=1, keepdim=True)
+        variance = torch.mean((psfs_flat - mean_psf) ** 2)
+        per_depth_l1 = torch.mean(torch.abs(psfs_flat - mean_psf), dim=-1)
+        worst_l1 = per_depth_l1.max()
 
-        diff = outputs - targets
-        loss = torch.mean(torch.abs(diff)) * 1e2
+        depth_idx = torch.arange(depth, device=psfs.device, dtype=psfs.dtype)
+        energy = psfs_flat.sum(dim=-1)
+        depth_prob = energy / (energy.sum(dim=1, keepdim=True) + eps)
+        depth_center = (depth_prob * depth_idx).sum(dim=1)
 
-        return loss
+        return {
+            'variance': variance,
+            'worst_l1': worst_l1,
+            'depth_center': depth_center,
+        }
 
     @torch.no_grad()
     def __log_images(self, psfs, targets, captimgs, outputs, tag: str, batch_idx=None):
@@ -212,13 +215,14 @@ class flatscope(pl.core.LightningModule):
              outputs_vis[0].unsqueeze(1)], dim=-2)
         grid_summary_image = torchvision.utils.make_grid(summary_image, nrow=captimgs.shape[1], padding=2)
 
-        if tag == 'test':
-            self.logger.experiment.add_image(f'{tag}/summary_image_{batch_idx}', grid_summary_image, self.global_step)
-        else:
-            self.logger.experiment.add_image(f'{tag}/summary_image', grid_summary_image, self.global_step)
+        if self.logger is not None and getattr(self.logger, 'experiment', None) is not None:
+            if tag == 'test':
+                self.logger.experiment.add_image(f'{tag}/summary_image_{batch_idx}', grid_summary_image, self.global_step)
+            else:
+                self.logger.experiment.add_image(f'{tag}/summary_image', grid_summary_image, self.global_step)
 
-        if self.hparams.optimize_optics or self.global_step == 0:
-            phase_bias = imresize(self.camera.phase_bias() % (2 * torch.pi), self.hparams.summary_image_sz)
+        if (self.cfg.optimize_optics or self.global_step == 0) and self.logger is not None and getattr(self.logger, 'experiment', None) is not None:
+            phase_bias = imresize(self.camera.phase_bias() % (2 * torch.pi), self.cfg.summary_image_sz)
             phase_bias /= phase_bias.max()
 
             self.logger.experiment.add_image('optics/optim_phase_bias{}'.format(self.global_step), phase_bias[0],
@@ -244,20 +248,22 @@ class flatscope(pl.core.LightningModule):
         parser.add_argument('--summary_track_train_every', type=int, default=500)
 
         # training parameters
-        parser.add_argument('--cnn_lr', type=float, default=1e-3)
         parser.add_argument('--optics_lr', type=float, default=2e-3)
-        parser.add_argument('--gamma_lr', type=float, default=0e-4)
+        parser.add_argument('--lr_gamma', type=float, default=0.98)
         parser.add_argument('--batch_sz', type=int, default=1)
-        parser.add_argument('--gamma', type=float, default=0.98)
         parser.add_argument('--test_batch_sz', type=int, default=8)
         parser.add_argument('--num_workers', type=int, default=0)
         parser.add_argument('--l1_loss_weight', type=float, default=1.0)
+        parser.add_argument('--reconstruction_crop', type=int, default=288)
+        parser.add_argument('--psf_binning_factor', type=int, default=1)
+        parser.add_argument('--psf_chunk_size', type=int, default=2)
+        parser.add_argument('--psf_consistency_weight', type=float, default=0.0)
+        parser.add_argument('--psf_worst_weight', type=float, default=0.0)
+        parser.add_argument('--focus_balance_weight', type=float, default=0.0)
+        parser.add_argument('--focus_center_target', type=float, default=-1.0)
 
-        parser.add_argument('--noise_sigma_min', type=float, default=0.00)
-        parser.add_argument('--noise_sigma_max', type=float, default=0.00)
-        parser.add_argument('--deconvolution', dest='deconvolution', action='store_true')
-        parser.add_argument('--no-deconvolution', dest='deconvolution', action='store_false')
-        parser.set_defaults(deconvolution=True)
+        parser.add_argument('--noise_sigma_min', type=float, default=0.0)
+        parser.add_argument('--noise_sigma_max', type=float, default=0.01)
         parser.add_argument('--augment', default=False, action='store_true')
 
         # dataset parameters
@@ -270,6 +276,14 @@ class flatscope(pl.core.LightningModule):
         parser.add_argument('--d1', type=float, default=65e-3)
         parser.add_argument('--d2', type=float, default=13.59e-3)
         parser.add_argument('--num_polynomials', type=int, default=100)
+        parser.add_argument('--psf_window', type=int, default=288)
+        parser.add_argument('--mask_pixel_pitch', type=float, default=2e-6)
+        parser.add_argument('--ring_softness', type=float, default=80.0)
+        parser.add_argument('--psf_crop_size', type=int, default=288,
+                    help='Central PSF region (pixels) retained after propagation; set smaller than psf_window to shrink FOV without altering sampling.')
+        parser.add_argument('--depth_min', type=float, default=-0.5e-3)
+        parser.add_argument('--depth_max', type=float, default=0.5e-3)
+        parser.add_argument('--depth_planes', type=int, default=3)
         parser.add_argument('--optimize_optics', dest='optimize_optics', action='store_true')
         parser.add_argument('--no-optimize_optics', dest='optimize_optics', action='store_false')
         parser.set_defaults(optimize_optics=True)

@@ -87,18 +87,38 @@ def fft_2xPad_Conv2D(signal, kernel, groups=1):
 
     return output
 
-def conv_psf(obj, psf, use_FFT=True, mask=None):
+def conv_psf(obj, psf, use_FFT=True, mask=None, chunk_size=None):
 
 
     n_batch = obj.shape[0]
-    n_slm, n_mask, h, w = psf.shape
+    if psf.dim() == 4:
+        n_slm, n_mask, h, w = psf.shape
+    elif psf.dim() == 3:
+        n_slm = 1
+        n_mask, h, w = psf.shape
+        psf = psf.unsqueeze(0)
+    else:
+        raise ValueError(f"Unsupported PSF shape {psf.shape}; expected 3D or 4D tensor")
 
     psf = psf.view(-1, h, w).unsqueeze(1)
 
-    if use_FFT:
-        y = fft_2xPad_Conv2D(obj, psf)
+    num_filters = psf.shape[0]
+    if chunk_size is None or chunk_size <= 0 or chunk_size >= num_filters:
+        if use_FFT:
+            y = fft_2xPad_Conv2D(obj, psf)
+        else:
+            y = F.conv2d(obj, psf, padding='same')
     else:
-        y = F.conv2d(obj, psf, padding='same')
+        outputs = []
+        for start in range(0, num_filters, chunk_size):
+            end = min(start + chunk_size, num_filters)
+            psf_chunk = psf[start:end]
+            if use_FFT:
+                out_chunk = fft_2xPad_Conv2D(obj, psf_chunk)
+            else:
+                out_chunk = F.conv2d(obj, psf_chunk, padding='same')
+            outputs.append(out_chunk)
+        y = torch.cat(outputs, dim=1)
 
     y = y.view(n_batch, n_slm, n_mask, h, w)
     if n_slm == 1:

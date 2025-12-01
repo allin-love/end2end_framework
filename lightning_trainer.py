@@ -7,7 +7,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import LearningRateMonitor
 
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 from dataset import *
 
 from util.helper import *
@@ -40,9 +40,8 @@ def prepare_data(hparams):  # 把训练集划分为18k训练和4k验证
         ])
     dataset = fluorescence(data_folder=simdata_dir, input_transforms=transform)
 
-    train_dataset = torch.utils.data.Subset(dataset,
-                                            range(val_idx, len(dataset)))
-    val_dataset = torch.utils.data.Subset(dataset, range(val_idx))
+    train_dataset = Subset(dataset, range(val_idx, len(dataset)))
+    val_dataset = Subset(dataset, range(val_idx))
 
     train_dataloader = DataLoader(train_dataset, batch_size=hparams.batch_sz,
                                   num_workers=hparams.num_workers, shuffle=True, pin_memory=True)
@@ -104,9 +103,9 @@ if __name__ == '__main__':
         gpus=1,
         default_root_dir=r"D:/user_doc/Remote/DOE/end2end_framework/training_logs",   #整个训练文件所在的根目录，自行修改
         max_epochs=50,
+        precision=16,
     )
 
     args = parser.parse_args()
 
-    with torch.autograd.set_detect_anomaly(True):
-        main(args)
+    main(args)
