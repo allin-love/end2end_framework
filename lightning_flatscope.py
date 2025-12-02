@@ -36,17 +36,32 @@ class flatscope(pl.LightningModule):
         loss_logs = {f'train_loss/{key}': val for key, val in loss_logs.items()}
 
         if self.cfg.optimize_optics:
-            misc_logs = {
-                'optics/optim_param_max': self.camera.optim_param.max(),
-                'optics/optim_param_min': self.camera.optim_param.min(),
-                'optics/optim_param_mean': self.camera.optim_param.mean(),
-            }
-            with torch.no_grad():
-                ring_radii = self.camera.get_ring_radii().detach()
-                lens_radius_mm = self.cfg.lens_diameter * 1e3 / 2.0
-                spacing = torch.diff(ring_radii, prepend=ring_radii.new_tensor([0.0])) * lens_radius_mm
-                misc_logs['optics/min_ring_spacing_um'] = spacing.min() * 1e3
-                misc_logs['optics/max_ring_spacing_um'] = spacing.max() * 1e3
+            misc_logs = {}
+            if hasattr(self.camera, 'optim_param'):
+                 misc_logs.update({
+                    'optics/optim_param_max': self.camera.optim_param.max(),
+                    'optics/optim_param_min': self.camera.optim_param.min(),
+                    'optics/optim_param_mean': self.camera.optim_param.mean(),
+                 })
+            
+            # 记录梯度强度 (调试用)
+            if hasattr(self.camera, 'optim_param') and self.camera.optim_param.grad is not None:
+                grad_mean = self.camera.optim_param.grad.abs().mean().item()
+                # 记录到 wandb/tensorboard
+                misc_logs['optics/grad_mean'] = grad_mean
+                # 终端打印 (防止刷屏，每50个step打印一次)
+                if batch_idx % 50 == 0:
+                    print(f"DEBUG: Gradient Strength = {grad_mean:.2e}")
+
+            if hasattr(self.camera, 'get_ring_radii'):
+                with torch.no_grad():
+                    ring_radii = self.camera.get_ring_radii().detach()
+                    lens_radius_mm = self.cfg.lens_diameter * 1e3 / 2.0
+                    spacing = torch.diff(ring_radii, prepend=ring_radii.new_tensor([0.0])) * lens_radius_mm
+                    misc_logs['optics/min_ring_spacing_um'] = spacing.min() * 1e3
+                    misc_logs['optics/max_ring_spacing_um'] = spacing.max() * 1e3
+            
+            if hasattr(self.camera, 'mask_pixel_pitch'):
                 misc_logs['optics/mask_pixel_pitch_um'] = torch.tensor(self.camera.mask_pixel_pitch * 1e6)
 
         logs = {}
@@ -108,8 +123,8 @@ class flatscope(pl.LightningModule):
 
         camera_recipe = {
             'image_size': hparams.image_size,
-            'sensor_diameter': hparams.sensor_diameter,  # 384
-            'lens_diameter': hparams.lens_diameter,  # 3.5328e-3
+            'sensor_diameter': hparams.sensor_diameter,
+            'lens_diameter': hparams.lens_diameter,
             'camera_pixel_pitch': hparams.camera_pixel_pitch,
             'd1': hparams.d1,
             'd2': hparams.d2,
@@ -118,18 +133,19 @@ class flatscope(pl.LightningModule):
 
         optimize_optics = hparams.optimize_optics
 
-        ########选择你需要的cameara（每个cameara的DOE的参数化方式不同）
-        # self.camera = camera_zernike_axial.BaseCamera(**camera_recipe, requires_grad=optimize_optics)   #用zernike表示相位面
-        # self.camera = camera_rotation_axial.BaseCamera(**camera_recipe, requires_grad=optimize_optics) #用旋转对称型结构表示相位面
-
         # 新增：同心圆二元相位板（更适合加工）
         # 将 num_polynomials 参数映射为 num_rings（环带数量）
         camera_recipe_rings = camera_recipe.copy()
-        camera_recipe_rings['num_rings'] = camera_recipe_rings.pop('num_polynomials')  # 用 num_rings 代替 num_polynomials
+        
+        # --- 核心配置 ---
+        camera_recipe_rings['train_downsample'] = 4
+        camera_recipe_rings['num_rings'] = 100 
+        
         camera_recipe_rings['window_cropsize'] = getattr(hparams, 'psf_window', camera_recipe_rings['image_size'])
         camera_recipe_rings['mask_pixel_pitch'] = getattr(hparams, 'mask_pixel_pitch', 2e-6)
         camera_recipe_rings['ring_softness'] = getattr(hparams, 'ring_softness', 60.0)
         camera_recipe_rings['psf_crop_size'] = getattr(hparams, 'psf_crop_size', camera_recipe_rings['window_cropsize'])
+        
         self.camera = camera_binary_rings.BinaryRingsCamera(**camera_recipe_rings, require_grad=optimize_optics)
 
         depth_min = getattr(hparams, 'depth_min', -0.5e-3)
@@ -147,7 +163,7 @@ class flatscope(pl.LightningModule):
             'image_l1_loss': image_l1_loss,
         }
 
-        total_loss = self.cfg.l1_loss_weight * image_l1_loss
+        total_loss = self.cfg.l1_loss_weight * image_l1_loss*1000
 
         if psfs is not None:
             psf_terms = self.__psf_regularizers(psfs)
@@ -177,8 +193,22 @@ class flatscope(pl.LightningModule):
 
 
     def img_l1_loss(self, targets, outputs):
-        return F.l1_loss(outputs, targets)
+        # 1. 广播对齐目标维度
+        if outputs.shape != targets.shape:
+            targets = targets.expand_as(outputs)
+            
+        # 计算每张图的平均亮度
+        # keepdim=True 保持形状为 [Batch, Channels, 1, 1]
+        target_mean = targets.mean(dim=(-1, -2), keepdim=True)
+        output_mean = outputs.mean(dim=(-1, -2), keepdim=True) + 1e-8
+        
+        # 计算缩放因子：让 Output 的亮度去匹配 Target
+        scale = target_mean / output_mean
+        
+        # 缩放 Output (使用 detach() 避免缩放因子参与梯度计算，防止不稳定)
+        outputs_scaled = outputs * scale.detach()
 
+        return F.l1_loss(outputs_scaled, targets)
     def __psf_regularizers(self, psfs):
         eps = 1e-8
         psfs = psfs / (psfs.sum(dim=(-2, -1), keepdim=True) + eps)
@@ -200,47 +230,82 @@ class flatscope(pl.LightningModule):
             'depth_center': depth_center,
         }
 
+    def on_after_backward(self):
+        if self.global_step % 50 == 0 and hasattr(self.camera, 'optim_param'):
+            if self.camera.optim_param.grad is not None:
+                grad_mean = self.camera.optim_param.grad.abs().mean().item()
+                # 打印真实梯度，如果在 0.01 ~ 10.0 之间就是健康的
+                print(f"REAL GRADIENT: {grad_mean:.2e}")
+            else:
+                print("No gradient found on optim_param")
+
     @torch.no_grad()
     def __log_images(self, psfs, targets, captimgs, outputs, tag: str, batch_idx=None):
+        """
+        兼容 TensorBoard 和 WandB 的图片记录函数
+        """
+        # 1. 准备图片数据 (Detach + CPU + Normalize)
+        def process_vis(tensor):
+            t = tensor.detach().cpu().float()
+            # 简单的最大值归一化，防止除零
+            t = F.relu(t) / (t.amax(dim=(-1, -2), keepdim=True) + 1e-8)
+            return t
 
+        captimgs_vis = process_vis(captimgs)
+        outputs_vis = process_vis(outputs) * 0.9 # 稍微暗一点区分 GT
+        targets_vis = targets.detach().cpu()
 
-        captimgs_vis = F.relu(captimgs, inplace=False) / \
-                       captimgs.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
-
-        scale = 0.9 / outputs.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
-        outputs_vis = F.relu(outputs, inplace=False) * scale
-
+        # 拼图
+        # shape: [Batch, 3, H, W]
+        # expand targets to match channels if needed
         summary_image = torch.cat(
-            [targets[0].unsqueeze(1).repeat(captimgs.shape[1], 1, 1, 1), captimgs_vis[0].unsqueeze(1),
+            [targets_vis[0].unsqueeze(1).repeat(captimgs.shape[1], 1, 1, 1), 
+             captimgs_vis[0].unsqueeze(1),
              outputs_vis[0].unsqueeze(1)], dim=-2)
+        
         grid_summary_image = torchvision.utils.make_grid(summary_image, nrow=captimgs.shape[1], padding=2)
 
-        if self.logger is not None and getattr(self.logger, 'experiment', None) is not None:
-            if tag == 'test':
-                self.logger.experiment.add_image(f'{tag}/summary_image_{batch_idx}', grid_summary_image, self.global_step)
+        # 2. 定义兼容的 Log 函数
+        def log_image_to_logger(key, img_tensor, step):
+            logger_exp = self.logger.experiment
+            
+            # 检查是否是 TensorBoard (有 add_image 方法)
+            if hasattr(logger_exp, 'add_image'):
+                logger_exp.add_image(key, img_tensor, step)
+            
+            # 检查是否是 WandB (没有 add_image，但通常能 import wandb)
             else:
-                self.logger.experiment.add_image(f'{tag}/summary_image', grid_summary_image, self.global_step)
+                try:
+                    import wandb
+                    # WandB 需要 list of wandb.Image
+                    # img_tensor 是 (C, H, W)，wandb.Image 能处理
+                    logger_exp.log({key: [wandb.Image(img_tensor, caption=key)]}, step=step)
+                except ImportError:
+                    pass # 没有装 wandb 就不记了
+                except Exception as e:
+                    print(f"WandB logging failed: {e}")
 
-        if (self.cfg.optimize_optics or self.global_step == 0) and self.logger is not None and getattr(self.logger, 'experiment', None) is not None:
-            phase_bias = imresize(self.camera.phase_bias() % (2 * torch.pi), self.cfg.summary_image_sz)
-            phase_bias /= phase_bias.max()
+        # 3. 记录 Summary Image
+        if self.logger is not None:
+            img_name = f'{tag}/summary_image_{batch_idx}' if tag == 'test' else f'{tag}/summary_image'
+            log_image_to_logger(img_name, grid_summary_image, self.global_step)
 
-            self.logger.experiment.add_image('optics/optim_phase_bias{}'.format(self.global_step), phase_bias[0],
-                                             self.global_step)
+        # 4. 记录光学相关图片 (仅训练初期或开启优化时)
+        if (self.cfg.optimize_optics or self.global_step == 0) and self.logger is not None:
+            # 记录相位图
+            if hasattr(self.camera, 'phase_bias'):
+                phase_bias = imresize(self.camera.phase_bias() % (2 * torch.pi), self.cfg.summary_image_sz)
+                phase_bias = phase_bias.detach().cpu()
+                phase_bias /= (phase_bias.max() + 1e-8)
+                log_image_to_logger('optics/optim_phase_bias', phase_bias[0], self.global_step)
 
-            psfs /= \
-                psfs.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
-            grid_modulated_psfs = torchvision.utils.make_grid(psfs.transpose(0, 1), nrow=3, pad_value=1,
-                                                              normalize=False)
-
-            self.logger.experiment.add_image('optics/modulated_psfs_stretched{}'.format(self.global_step),
-                                             grid_modulated_psfs, self.global_step)
+            # 记录 PSF
+            psfs_vis = process_vis(psfs)
+            grid_modulated_psfs = torchvision.utils.make_grid(psfs_vis.transpose(0, 1), nrow=3, pad_value=1, normalize=False)
+            log_image_to_logger('optics/modulated_psfs_stretched', grid_modulated_psfs, self.global_step)
 
     @staticmethod
     def add_model_specific_args(parent_parser):
-        """
-        Specify the hyperparams for this LightningModule
-        """
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
 
         # logger parameters

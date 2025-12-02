@@ -196,7 +196,9 @@ def main():
     print(f"✓ 模型加载成功")
     print(f"  - 环带数量: {camera.num_rings}")
     print(f"  - 透镜直径: {DEFAULT_PARAMS['lens_diameter']*1000:.2f} mm")
-    print(f"  - 相位板分辨率: {camera.valid_resolution} × {camera.valid_resolution}")
+# 计算分辨率：透镜直径 / 像素大小
+    res = int(camera.lens_diameter / camera.native_pixel_pitch)
+    print(f"  - 相位板分辨率: {res} × {res}")
     
     # 3. 可视化相位
     print("\n" + "-"*60)

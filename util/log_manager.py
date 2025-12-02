@@ -3,18 +3,50 @@ import shutil
 
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.callbacks.base import Callback
+from pytorch_lightning.loggers.base import LoggerCollection
 
 
 class LogManager(Callback):
 
+    def __init__(self, fallback_log_dir=None):
+        super().__init__()
+        self.fallback_log_dir = fallback_log_dir
+
+    def _resolve_log_dir(self, logger):
+        if logger is None:
+            return None
+
+        if isinstance(logger, LoggerCollection):
+            for child in logger.loggers:
+                path = self._resolve_log_dir(child)
+                if path:
+                    return path
+            return None
+
+        log_dir = getattr(logger, 'log_dir', None)
+        if log_dir:
+            return log_dir
+
+        save_dir = getattr(logger, 'save_dir', None)
+        name = getattr(logger, 'name', None)
+        version = getattr(logger, 'version', None)
+        if save_dir and name is not None and version is not None:
+            return os.path.join(save_dir, name, f'version_{version}')
+
+        return None
+
     def on_init_end(self, trainer):
-        ckpt_dir = os.path.join(trainer.logger.log_dir, 'checkpoints')
+        log_dir = self._resolve_log_dir(trainer.logger) or self.fallback_log_dir
+        if log_dir is None:
+            raise ValueError('Unable to determine log directory for LogManager. Provide fallback_log_dir.')
+
+        ckpt_dir = os.path.join(log_dir, 'checkpoints')
         print("*"*30)
         print('checkpoint_dir', ckpt_dir)
         print("*"*30)
         if os.path.exists(ckpt_dir):
             ckpt_list = [filename for filename in os.listdir(ckpt_dir) if '.ckpt' in filename]
-            print(f'Log and the following checkpoint exists:\n Log dir: {trainer.logger.log_dir}\n' + '\n'.join(
+            print(f'Log and the following checkpoint exists:\n Log dir: {log_dir}\n' + '\n'.join(
                 f'[{i}] {filename}' for i, filename in enumerate(ckpt_list)))
 
             delete = ['delete', 'd']
@@ -26,8 +58,8 @@ class LogManager(Callback):
                 ans = input(f'[Number of ckpt files: {n_files}]\n'	
                             f'Delete the existing log and start a new experiment? Resume? Quit? (d/r/q) << ').lower()
                 if ans in delete:
-                    shutil.rmtree(trainer.logger.log_dir)
-                    os.makedirs(trainer.logger.log_dir)
+                    shutil.rmtree(log_dir)
+                    os.makedirs(log_dir)
                 elif ans in resume:
                     if n_files == 0:
                         print('Any checkpoint files do not exist!')
@@ -44,7 +76,7 @@ class LogManager(Callback):
                 elif ans in quit:
                     raise ValueError('Stopped as the log exist for this experiment.')
         else:
-            print(f'Starting a new experiment and logging at \n {os.path.expanduser(trainer.logger.log_dir)}')
+            print(f'Starting a new experiment and logging at \n {os.path.expanduser(log_dir)}')
 
     def on_keyboard_interrupt(self, trainer, pl_module):
         if pl_module.global_rank == 0:
@@ -53,7 +85,7 @@ class LogManager(Callback):
             ans = ''
             while not (ans in no or ans in yes):
                 ans = input('Save this run? (Y/N) << ').lower()
-                log_dir = trainer.logger.log_dir
+                log_dir = self._resolve_log_dir(trainer.logger) or self.fallback_log_dir
                 if ans in no:
                     shutil.rmtree(log_dir)
                     print(f'Deleted {log_dir}')
