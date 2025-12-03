@@ -19,7 +19,7 @@ DEFAULT_PARAMS = {
     "camera_pixel_pitch": 1.0e-6,
     "d1": 65e-3,
     "d2": 13.59e-3,
-    "num_rings": 100,
+    "num_rings": 20,
     "require_grad": False,
 }
 DEFAULT_WINDOW = 128

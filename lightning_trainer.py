@@ -125,7 +125,7 @@ if __name__ == '__main__':
     parser.add_argument('--experiment_name', type=str, default='Learned_flatscope')
     parser.add_argument('--dataset', type=str, default='fluorescence')
     parser.add_argument('--mix_dataset', action='store_true')
-    parser.add_argument('--simdata_dir', type=str, default=r"D:/user_doc/Remote/DOE/data/sample_data_500_mag0.4_img_crop")
+    parser.add_argument('--simdata_dir', type=str, default=r"D:/user_doc/Remote/DOE/data/sample_data_500_img_crop")
     parser.set_defaults(mix_dataset=False)
 
     parser.add_argument('--use_wandb', action='store_true', help='Enable Weights & Biases logging')
@@ -144,8 +144,8 @@ if __name__ == '__main__':
     parser.set_defaults(
         gpus=1,
         default_root_dir=r"D:/user_doc/Remote/DOE/end2end_framework/training_logs",   #整个训练文件所在的根目录，自行修改
-        max_epochs=50,
-        precision=16,
+        max_epochs=500,
+        precision=32,
     )
 
     args = parser.parse_args()

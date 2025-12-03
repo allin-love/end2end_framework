@@ -139,7 +139,7 @@ class flatscope(pl.LightningModule):
         
         # --- 核心配置 ---
         camera_recipe_rings['train_downsample'] = 4
-        camera_recipe_rings['num_rings'] = 100 
+        camera_recipe_rings['num_rings'] = 20 
         
         camera_recipe_rings['window_cropsize'] = getattr(hparams, 'psf_window', camera_recipe_rings['image_size'])
         camera_recipe_rings['mask_pixel_pitch'] = getattr(hparams, 'mask_pixel_pitch', 2e-6)
@@ -313,18 +313,18 @@ class flatscope(pl.LightningModule):
         parser.add_argument('--summary_track_train_every', type=int, default=500)
 
         # training parameters
-        parser.add_argument('--optics_lr', type=float, default=2e-3)
+        parser.add_argument('--optics_lr', type=float, default=2e-4)
         parser.add_argument('--lr_gamma', type=float, default=0.98)
-        parser.add_argument('--batch_sz', type=int, default=1)
+        parser.add_argument('--batch_sz', type=int, default=4)
         parser.add_argument('--test_batch_sz', type=int, default=8)
         parser.add_argument('--num_workers', type=int, default=0)
         parser.add_argument('--l1_loss_weight', type=float, default=1.0)
         parser.add_argument('--reconstruction_crop', type=int, default=288)
         parser.add_argument('--psf_binning_factor', type=int, default=1)
         parser.add_argument('--psf_chunk_size', type=int, default=2)
-        parser.add_argument('--psf_consistency_weight', type=float, default=0.0)
-        parser.add_argument('--psf_worst_weight', type=float, default=0.0)
-        parser.add_argument('--focus_balance_weight', type=float, default=0.0)
+        parser.add_argument('--psf_consistency_weight', type=float, default=5.0)
+        parser.add_argument('--psf_worst_weight', type=float, default=2.0)
+        parser.add_argument('--focus_balance_weight', type=float, default=10.0)
         parser.add_argument('--focus_center_target', type=float, default=-1.0)
 
         parser.add_argument('--noise_sigma_min', type=float, default=0.0)
@@ -340,10 +340,10 @@ class flatscope(pl.LightningModule):
         parser.add_argument('--lens_diameter', type=float, default=3.45e-3)
         parser.add_argument('--d1', type=float, default=65e-3)
         parser.add_argument('--d2', type=float, default=13.59e-3)
-        parser.add_argument('--num_polynomials', type=int, default=100)
+        parser.add_argument('--num_polynomials', type=int, default=60)
         parser.add_argument('--psf_window', type=int, default=288)
         parser.add_argument('--mask_pixel_pitch', type=float, default=2e-6)
-        parser.add_argument('--ring_softness', type=float, default=80.0)
+        parser.add_argument('--ring_softness', type=float, default=20)
         parser.add_argument('--psf_crop_size', type=int, default=288,
                     help='Central PSF region (pixels) retained after propagation; set smaller than psf_window to shrink FOV without altering sampling.')
         parser.add_argument('--depth_min', type=float, default=-0.5e-3)
